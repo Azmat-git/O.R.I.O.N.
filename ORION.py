@@ -1,16 +1,14 @@
 import os
 import sys
 import glob
-import ast
 import json
-import shutil
 import asyncio
 import logging
 import inspect
 import tempfile
 import importlib.util
 from datetime import datetime
-from typing import Any, Callable, get_type_hints
+from typing import Any, Callable
 from dotenv import load_dotenv
 
 from telegram import Update, Message
@@ -30,7 +28,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 AUTHORIZED_USER_ID = int(os.getenv('AUTHORIZED_USER_ID', '0'))
-MODEL_NAME = os.getenv('MODEL_NAME', 'mistral-small:24b')
+MODEL_NAME = os.getenv('MODEL_NAME', 'mistral:7b')
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://127.0.0.1:11434')
 
 # Paramètres d'inférence stricts pour fiabiliser le Tool Calling
@@ -51,11 +49,10 @@ agent_lock = asyncio.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 KNOWLEDGE_DIR = os.path.join(BASE_DIR, 'knowledge')
 PLUGINS_DIR = os.path.join(BASE_DIR, 'plugins')
-PENDING_PLUGINS_DIR = os.path.join(BASE_DIR, 'plugins_pending')
 CREDENTIALS_DIR = os.path.join(BASE_DIR, 'credentials')
 MEMORY_FILE = os.path.join(BASE_DIR, 'memory_state.json')
 
-for directory in (KNOWLEDGE_DIR, PLUGINS_DIR, PENDING_PLUGINS_DIR, CREDENTIALS_DIR):
+for directory in (KNOWLEDGE_DIR, PLUGINS_DIR, CREDENTIALS_DIR):
     os.makedirs(directory, exist_ok=True)
 
 # Limites et sécurité
@@ -63,7 +60,6 @@ MAX_HISTORY_TURNS = 10
 MAX_KNOWLEDGE_CHARS = 5000
 MAX_TOOL_OUTPUT_CHARS = 6000
 TOOL_EXECUTION_TIMEOUT = 30.0  # Secondes max par appel d'outil
-BANNED_MODULES = {'shutil', 'subprocess', 'pty', 'paramiko', 'ctypes'}
 
 # ==============================================================================
 # GESTION ATOMIQUE DE LA MÉMOIRE COURT TERME
@@ -173,101 +169,18 @@ def get_current_time() -> str:
     return datetime.now().strftime("%A %d %B %Y à %H:%M:%S")
 
 
-def read_plugin_code(plugin_name: str) -> str:
-    """
-    Lit le code source d'un plugin (actif ou en quarantaine) pour diagnostiquer un bug
-    ou vérifier son implémentation avant de le corriger.
-    """
-    safe_name = os.path.basename(plugin_name.strip())
-    if not safe_name.endswith('.py'):
-        safe_name += '.py'
-
-    for folder_label, folder_path in [("plugins (actif)", PLUGINS_DIR), ("plugins_pending (quarantaine)", PENDING_PLUGINS_DIR)]:
-        candidate = os.path.join(folder_path, safe_name)
-        if os.path.exists(candidate):
-            try:
-                with open(candidate, 'r', encoding='utf-8') as f:
-                    return f"--- Code source de {safe_name} [{folder_label}] ---\n{f.read()}"
-            except Exception as e:
-                return f"Erreur de lecture de {safe_name} : {e}"
-
-    return f"Aucun plugin nommé '{safe_name}' trouvé dans plugins/ ou plugins_pending/."
-
-
-def validate_ast_safety(python_code: str) -> tuple[bool, str]:
-    """Vérifie la syntaxe Python, bloque les imports dangereux et vérifie la présence de return."""
-    try:
-        tree = ast.parse(python_code)
-    except SyntaxError as err:
-        return False, f"Erreur de syntaxe ligne {err.lineno} : {err.msg}"
-
-    has_public_function = False
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                root_mod = alias.name.split('.')[0]
-                if root_mod in BANNED_MODULES:
-                    return False, f"Sécurité : Import du module '{root_mod}' interdit."
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                root_mod = node.module.split('.')[0]
-                if root_mod in BANNED_MODULES:
-                    return False, f"Sécurité : Import depuis '{root_mod}' interdit."
-        elif isinstance(node, ast.FunctionDef) and not node.name.startswith("_"):
-            has_public_function = True
-            has_return = any(isinstance(sub, ast.Return) and sub.value is not None for sub in ast.walk(node))
-            if not has_return:
-                return (
-                    False,
-                    f"Qualité : La fonction publique '{node.name}' ne contient aucune instruction 'return <valeur>'. "
-                    f"Chaque outil doit retourner une chaîne de caractères (str) exploitable par l'agent."
-                )
-
-    if not has_public_function:
-        return False, "Qualité : Le plugin doit définir au moins une fonction publique (sans '_' au début)."
-
-    return True, "OK"
-
-
-def create_plugin(plugin_name: str, python_code: str) -> str:
-    """
-    Valide l'AST (syntaxe, sécurité, présence de return) et écrit le plugin dans plugins_pending/.
-    Requiert l'approbation de Florian via /approve sur Telegram.
-    """
-    safe_name = os.path.basename(plugin_name.strip())
-    if not safe_name.endswith('.py'):
-        safe_name += '.py'
-
-    is_valid, reason = validate_ast_safety(python_code)
-    if not is_valid:
-        return f"Rejet du plugin '{safe_name}' -> {reason}. Corrige le code et rappelle create_plugin."
-
-    filepath = os.path.join(PENDING_PLUGINS_DIR, safe_name)
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            f.write(python_code)
-        return (
-            f"Succès : Le plugin '{safe_name}' a été validé (AST + return check) et placé en quarantaine. "
-            f"Demande à Florian de l'activer avec la commande : /approve {safe_name}"
-        )
-    except Exception as e:
-        return f"Erreur d'écriture disque : {e}"
-
-
 CORE_TOOLS: dict[str, Callable] = {
     'search_knowledge': search_knowledge,
     'save_note': save_note,
     'get_current_time': get_current_time,
-    'read_plugin_code': read_plugin_code,
-    'create_plugin': create_plugin,
 }
 
 AVAILABLE_TOOLS: dict[str, Callable] = {}
 tools_schema: list[dict] = []
+_PLUGINS_STATE: dict[str, float] = {}
 
 # ==============================================================================
-# 2. INTROSPECTION STRICTE & COERCITION DE TYPES
+# 2. ARCHITECTURE PLUG-AND-PLAY & INTROSPECTION
 # ==============================================================================
 
 def generate_schema_from_function(func: Callable, module_name: str = "core") -> dict:
@@ -350,9 +263,24 @@ def coerce_arguments(func: Callable, raw_args: dict) -> dict:
     return coerced
 
 
+def _get_plugins_fingerprint() -> dict[str, float]:
+    """Retourne un dictionnaire {filepath: mtime} des plugins présents dans plugins/."""
+    files = sorted(glob.glob(os.path.join(PLUGINS_DIR, "*.py")))
+    return {
+        f: os.path.getmtime(f)
+        for f in files
+        if not os.path.basename(f).startswith("__")
+    }
+
+
 def load_plugins() -> int:
-    """Charge les outils Core puis importe proprement tous les plugins actifs."""
-    global AVAILABLE_TOOLS, tools_schema
+    """
+    Charge les outils Core puis branche automatiquement tous les modules déposés dans plugins/.
+    Supporte deux formats Plug-and-Play :
+    1. Explicite : Le module définit TOOLS (dict) et optionnellement TOOLS_SCHEMA (list).
+    2. Automatique : Le module définit simplement des fonctions Python publiques typées.
+    """
+    global AVAILABLE_TOOLS, tools_schema, _PLUGINS_STATE
     AVAILABLE_TOOLS = dict(CORE_TOOLS)
     tools_schema = [generate_schema_from_function(fn, "core") for fn in CORE_TOOLS.values()]
 
@@ -365,7 +293,6 @@ def load_plugins() -> int:
             continue
 
         try:
-            # Purge du cache sys.modules pour garantir un vrai rechargement à chaud
             full_mod_name = f"orion_plugin_{module_name}"
             if full_mod_name in sys.modules:
                 del sys.modules[full_mod_name]
@@ -378,13 +305,26 @@ def load_plugins() -> int:
             sys.modules[full_mod_name] = module
             spec.loader.exec_module(module)
 
+            # Format 1 : Le plugin expose explicitement TOOLS (et éventuellement TOOLS_SCHEMA)
             if hasattr(module, "TOOLS") and isinstance(module.TOOLS, dict):
+                explicit_schemas = {}
+                if hasattr(module, "TOOLS_SCHEMA") and isinstance(module.TOOLS_SCHEMA, list):
+                    for s in module.TOOLS_SCHEMA:
+                        fn_n = s.get('function', {}).get('name')
+                        if fn_n:
+                            explicit_schemas[fn_n] = s
+
                 for fn_name, fn_obj in module.TOOLS.items():
                     if callable(fn_obj):
                         AVAILABLE_TOOLS[fn_name] = fn_obj
-                        schema = generate_schema_from_function(fn_obj, module_name)
-                        schema['function']['name'] = fn_name
-                        tools_schema.append(schema)
+                        if fn_name in explicit_schemas:
+                            tools_schema.append(explicit_schemas[fn_name])
+                        else:
+                            schema = generate_schema_from_function(fn_obj, module_name)
+                            schema['function']['name'] = fn_name
+                            tools_schema.append(schema)
+
+            # Format 2 : Plug-and-Play pur (auto-découverte des fonctions publiques du fichier)
             else:
                 for attr_name, attr in inspect.getmembers(module, inspect.isfunction):
                     if not attr_name.startswith("_") and attr.__module__ == full_mod_name:
@@ -392,13 +332,23 @@ def load_plugins() -> int:
                         tools_schema.append(generate_schema_from_function(attr, module_name))
 
             loaded_count += 1
-            logging.info(f"Plugin actif chargé : {module_name}")
+            logging.info(f"Plugin Plug-and-Play actif : {module_name}")
         except Exception as e:
             logging.error(f"Erreur au chargement du plugin {module_name} : {e}")
 
+    _PLUGINS_STATE = _get_plugins_fingerprint()
     return loaded_count
 
 
+def ensure_plugins_up_to_date() -> None:
+    """Vérifie si un fichier a été ajouté, modifié ou supprimé dans plugins/ et recharge à chaud."""
+    current_state = _get_plugins_fingerprint()
+    if current_state != _PLUGINS_STATE:
+        logging.info("Modification détectée dans le dossier plugins/ -> Rechargement automatique à chaud.")
+        load_plugins()
+
+
+# Chargement initial au démarrage
 load_plugins()
 
 # ==============================================================================
@@ -414,7 +364,7 @@ Tu opères selon 5 piliers fondamentaux non négociables :
 
 2. ALIGNEMENT STRICT, INTÉRÊT EXCLUSIF & ARBITRAGE (HUMAN-IN-THE-LOOP)
 - Tu agis en toutes circonstances pour les intérêts exclusifs de Florian en optimisant son temps et ses ressources.
-- RÈGLE DU GARDE-FOU D'ÉCRITURE : Tu as l'interdiction formelle d'exécuter de manière autonome une action modifiant l'état du monde réel ou de ses données (création/suppression d'événements, envoi ou brouillon d'e-mails, écriture hors du dossier knowledge, suppression de fichiers, transactions).
+- RÈGLE DU GARDE-FOU D'ÉCRITURE : Tu as l'interdiction formelle d'exécuter de manière autonome une action modifiant l'état du monde réel ou de ses données (création/modification/suppression d'événements, envoi ou brouillon d'e-mails, suppression de données, transactions).
 - PROTOCOLE DE VALIDATION : Pour toute action d'écriture ou de modification, tu dois obligatoirement présenter un récapitulatif clair et complet des paramètres à Florian sur Telegram et attendre son accord explicite au message suivant avant de déclencher l'outil correspondant.
 
 3. INTÉGRITÉ FACTUELLE & VÉRITÉ OPÉRATIONNELLE (ZÉRO HALLUCINATION)
@@ -422,14 +372,13 @@ Tu opères selon 5 piliers fondamentaux non négociables :
 - DÉPENDANCE AU RETOUR OUTIL : Dès qu'une requête nécessite une information extérieure ou système, émets l'appel d'outil officiel et attends impérativement le retour système ('role': 'tool') avant de formuler ta réponse.
 - GESTION DU VIDE : Si un outil renvoie une liste vide, une absence de données ou une erreur, constate-le factuellement et sobrement auprès de Florian sans combler les manques par de l'imagination.
 
-4. ÉVOLUTIVITÉ MODULAIRE & GESTION DES COMPÉTENCES
-- ÉCOSYSTÈME DE PLUGINS : Tu ne touches jamais au fichier cœur (orion.py). Toute compétence technique réside exclusivement dans plugins/.
-- CONSCIENCE DE L'EXISTANT : Avant de déclarer qu'une fonctionnalité est absente ou d'envisager l'écriture d'un script, consulte systématiquement la liste des plugins chargés et des outils actifs. Ne tente jamais de réécrire ou de dupliquer un module déjà présent.
-- DISTINCTION MODULE / FONCTION : Un plugin est un fichier Python (ex: google_calendar.py) qui peut regrouper plusieurs outils distincts (ex: calendar_list_events, calendar_create_event). Ne confonds jamais le nom d'un fichier avec le nom d'une fonction interne.
+4. UTILISATION STRICTE DES OUTILS PLUG-AND-PLAY
+- Tu disposes uniquement des outils listés dans ton état système. Tu n'as pas la capacité de créer, coder ou modifier des plugins Python toi-même.
+- Si Florian te demande une action pour laquelle aucun outil n'est disponible dans ta liste active, indique-lui simplement quel outil ou connecteur il manque sans tenter de générer du code Python.
 
-5. RIGUEUR TECHNIQUE & AUTO-RÉPARATION RÉFLÉCHIE
-- RESPECT DES SCHÉMAS D'OUTILS : Vérifie scrupuleusement le nom et le typage des paramètres attendus par chaque outil (notamment formats de dates ISO, chaînes, entiers) avant de l'appeler.
-- ANALYSE DES ERREURS : En cas de rejet technique (TypeError, ValueError, exception d'API), analyse le message d'erreur retourné, adapte la structure de tes arguments ou tes filtres, et réessaie de manière méthodique sans déclarer prématurément que l'outil est inexistant.
+5. RIGUEUR TECHNIQUE & AUTO-CORRECTION DES PARAMÈTRES
+- RESPECT DES SCHÉMAS D'OUTILS : Vérifie scrupuleusement le nom exact et le typage des paramètres attendus par chaque outil (notamment formats de dates ISO, chaînes, entiers) avant de l'appeler.
+- ANALYSE DES ERREURS : En cas de rejet technique (TypeError, ValueError, argument manquant ou exception d'API), lis attentivement le message d'erreur retourné, corrige le nom ou le format de tes arguments et réessaie avec le même outil.
 - SIMPLICITÉ & FORMAT TELEGRAM : Formule des réponses directes, concises, structurées et sans bavardage ni politesses superflues."""
 
 # ==============================================================================
@@ -448,10 +397,7 @@ async def execute_tool_with_timeout(fn: Callable, raw_args: dict) -> str:
     result = await asyncio.wait_for(_run(), timeout=TOOL_EXECUTION_TIMEOUT)
 
     if result is None or str(result).strip() == "":
-        return (
-            f"Avertissement : La fonction '{fn.__name__}' a retourné None ou une chaîne vide. "
-            f"Si c'est un plugin, inspecte-le avec read_plugin_code('{fn.__name__}') pour vérifier son 'return'."
-        )
+        return f"Information : L'outil '{fn.__name__}' s'est exécuté sans retourner de données."
     if isinstance(result, (dict, list)):
         return json.dumps(result, ensure_ascii=False, indent=2)
     return str(result)
@@ -477,6 +423,9 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
 
     async with agent_lock:
         try:
+            # Vérification automatique à chaud si un nouveau plugin a été déposé dans plugins/
+            ensure_plugins_up_to_date()
+
             active_tools_list = list(AVAILABLE_TOOLS.keys())
             current_time_str = datetime.now().strftime("%A %d/%m/%Y à %H:%M:%S")
 
@@ -484,8 +433,7 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                 f"{BASE_SYSTEM_PROMPT}\n\n"
                 f"--- ÉTAT SYSTÈME ---\n"
                 f"- Date et heure : {current_time_str}\n"
-                f"- Dossier credentials OAuth/API : {CREDENTIALS_DIR}\n"
-                f"- Outils chargés ({len(active_tools_list)}) : {', '.join(active_tools_list)}"
+                f"- Outils actifs disponibles ({len(active_tools_list)}) : {', '.join(active_tools_list)}"
             )
 
             messages: list[dict[str, Any]] = [{'role': 'system', 'content': dynamic_system_prompt}]
@@ -526,7 +474,6 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                     break
 
                 # Cas 2 : Exécution d'un ou plusieurs outils
-                # Sérialisation propre en dict standard pour l'historique Ollama
                 serialized_calls = []
                 for tc in tool_calls:
                     serialized_calls.append({
@@ -546,7 +493,6 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                     fn_name = tc.function.name
                     fn_args = dict(tc.function.arguments or {})
 
-                    # Mise à jour visuelle en direct sur Telegram
                     try:
                         await status_msg.edit_text(f"⚙️ Étape {iteration}/{max_iterations} : exécution de `{fn_name}`...")
                     except Exception:
@@ -560,9 +506,13 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                         except asyncio.TimeoutError:
                             result = f"Erreur : L'outil '{fn_name}' a dépassé le délai maximum ({TOOL_EXECUTION_TIMEOUT}s)."
                         except Exception as err:
-                            result = f"Erreur d'exécution dans '{fn_name}' ({type(err).__name__}) : {err}"
+                            sig = inspect.signature(AVAILABLE_TOOLS[fn_name])
+                            result = (
+                                f"Erreur d'exécution dans '{fn_name}' ({type(err).__name__}) : {err}. "
+                                f"Signature attendue : {fn_name}{sig}"
+                            )
                     else:
-                        result = f"Erreur : Outil '{fn_name}' inconnu. Choisis parmi : {', '.join(active_tools_list)}"
+                        result = f"Erreur : Outil '{fn_name}' inexistant. Outils disponibles : {', '.join(active_tools_list)}"
 
                     if len(result) > MAX_TOOL_OUTPUT_CHARS:
                         result = result[:MAX_TOOL_OUTPUT_CHARS] + "\n...[Sortie tronquée]..."
@@ -587,8 +537,8 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                 synthesis_messages.append({
                     'role': 'user',
                     'content': (
-                        "Exploite les données brutes retournées par les outils ci-dessus et formule maintenant "
-                        "ta réponse complète et détaillée pour Florian. Affiche clairement les informations obtenues."
+                        "Exploite uniquement les données réelles retournées par les outils ci-dessus et formule "
+                        "maintenant ta réponse claire et factuelle pour Florian, sans inventer d'informations."
                     )
                 })
                 final_res = await ollama_client.chat(
@@ -630,73 +580,31 @@ def is_authorized(update: Update) -> bool:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    pending = [os.path.basename(f) for f in glob.glob(os.path.join(PENDING_PLUGINS_DIR, "*.py"))]
-    active_plugins = [os.path.basename(f) for f in glob.glob(os.path.join(PLUGINS_DIR, "*.py")) if not os.path.basename(f).startswith("__")]
+    ensure_plugins_up_to_date()
+    active_plugins = [
+        os.path.basename(f)
+        for f in sorted(glob.glob(os.path.join(PLUGINS_DIR, "*.py")))
+        if not os.path.basename(f).startswith("__")
+    ]
     msg = (
-        f"🛡️ **État du système O.R.I.O.N. v3**\n"
+        f"🛡️ **État du système O.R.I.O.N. v3 (Plug-and-Play)**\n"
         f"- Modèle : `{MODEL_NAME}` (temp={OLLAMA_OPTIONS['temperature']})\n"
         f"- Mémoire : `{len(CONVERSATION_HISTORY) // 2}/{MAX_HISTORY_TURNS}` tours\n"
-        f"- Plugins actifs ({len(active_plugins)}) : `{', '.join(active_plugins) or 'Aucun'}`\n"
-        f"- Outils disponibles ({len(AVAILABLE_TOOLS)}) : `{', '.join(AVAILABLE_TOOLS.keys())}`\n"
-        f"- En quarantaine ({len(pending)}) : `{', '.join(pending) or 'Aucun'}`"
+        f"- Modules plugins ({len(active_plugins)}) : `{', '.join(active_plugins) or 'Aucun'}`\n"
+        f"- Outils actifs ({len(AVAILABLE_TOOLS)}) : `{', '.join(AVAILABLE_TOOLS.keys())}`"
     )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
 
 async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Recharge manuellement les plugins à chaud après une modification sur le PC."""
+    """Force manuellement le rechargement de tous les plugins du dossier plugins/."""
     if not is_authorized(update):
         return
     count = load_plugins()
     await update.message.reply_text(
-        f"🔄 Plugins rechargés avec succès ({count} module(s)).\nOutils actifs : `{', '.join(AVAILABLE_TOOLS.keys())}`",
+        f"🔄 Plugins rechargés ({count} module(s)).\nOutils actifs : `{', '.join(AVAILABLE_TOOLS.keys())}`",
         parse_mode='Markdown'
     )
-
-
-async def cmd_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage : `/approve nom_plugin.py`", parse_mode='Markdown')
-        return
-
-    plugin_name = os.path.basename(context.args[0])
-    if not plugin_name.endswith('.py'):
-        plugin_name += '.py'
-
-    src = os.path.join(PENDING_PLUGINS_DIR, plugin_name)
-    dst = os.path.join(PLUGINS_DIR, plugin_name)
-
-    if not os.path.exists(src):
-        await update.message.reply_text(f"❌ `{plugin_name}` introuvable dans `plugins_pending/`.", parse_mode='Markdown')
-        return
-
-    shutil.move(src, dst)
-    count = load_plugins()
-    await update.message.reply_text(
-        f"✅ `{plugin_name}` activé ({count} plugins).\nOutils : `{', '.join(AVAILABLE_TOOLS.keys())}`",
-        parse_mode='Markdown'
-    )
-
-
-async def cmd_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update):
-        return
-    if not context.args:
-        await update.message.reply_text("Usage : `/reject nom_plugin.py`", parse_mode='Markdown')
-        return
-
-    plugin_name = os.path.basename(context.args[0])
-    if not plugin_name.endswith('.py'):
-        plugin_name += '.py'
-
-    src = os.path.join(PENDING_PLUGINS_DIR, plugin_name)
-    if os.path.exists(src):
-        os.remove(src)
-        await update.message.reply_text(f"🗑️ `{plugin_name}` supprimé de la quarantaine.", parse_mode='Markdown')
-    else:
-        await update.message.reply_text(f"❌ `{plugin_name}` introuvable.", parse_mode='Markdown')
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -732,10 +640,8 @@ if __name__ == '__main__':
 
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reload", cmd_reload))
-    app.add_handler(CommandHandler("approve", cmd_approve))
-    app.add_handler(CommandHandler("reject", cmd_reject))
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
 
-    print("ORION Core v3 opérationnel.")
+    print("ORION Core v3 (Plug-and-Play) opérationnel.")
     app.run_polling()
