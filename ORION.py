@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import glob
 import json
@@ -28,7 +29,7 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 AUTHORIZED_USER_ID = int(os.getenv('AUTHORIZED_USER_ID', '0'))
-MODEL_NAME = os.getenv('MODEL_NAME', 'mistral:7b')
+MODEL_NAME = os.getenv('MODEL_NAME', 'mistral-nemo')
 OLLAMA_HOST = os.getenv('OLLAMA_HOST', 'http://127.0.0.1:11434')
 
 # Paramètres d'inférence stricts pour fiabiliser le Tool Calling
@@ -62,27 +63,57 @@ MAX_TOOL_OUTPUT_CHARS = 6000
 TOOL_EXECUTION_TIMEOUT = 30.0  # Secondes max par appel d'outil
 
 # ==============================================================================
+# UTILITAIRE ANTI-TEXTE VIDE (NETTOYAGE UNICODE & TELEGRAM)
+# ==============================================================================
+
+# Supprime les caractères invisibles (zero-width space, BOM, etc.) fréquents dans les e-mails
+INVISIBLE_CHARS_RE = re.compile(r'[\u200b\u200c\u200d\u200e\u200f\ufeff\u00ad]+')
+
+
+def sanitize_text(val: Any) -> str:
+    """Nettoie une chaîne de tous les espaces et caractères invisibles qui font planter Telegram."""
+    if val is None:
+        return ""
+    cleaned = INVISIBLE_CHARS_RE.sub('', str(val))
+    return cleaned.strip()
+
+
+# ==============================================================================
 # GESTION ATOMIQUE DE LA MÉMOIRE COURT TERME
 # ==============================================================================
 
 def load_memory() -> list[dict]:
-    """Charge l'historique conversationnel depuis le disque."""
+    """Charge l'historique conversationnel et purge automatiquement toute entrée vide ou corrompue."""
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                return data if isinstance(data, list) else []
+                if not isinstance(data, list):
+                    return []
+                valid_history = []
+                for item in data:
+                    if isinstance(item, dict):
+                        role = item.get('role')
+                        content = sanitize_text(item.get('content', ''))
+                        if role in ('user', 'assistant') and content:
+                            valid_history.append({'role': role, 'content': content})
+                return valid_history
         except Exception as e:
             logging.error(f"Erreur de lecture mémoire : {e}")
     return []
 
 
 def save_memory(history: list[dict]) -> None:
-    """Sauvegarde atomique de l'historique pour éviter toute corruption de fichier."""
+    """Sauvegarde atomique de l'historique en garantissant qu'aucun message vide n'est écrit."""
     try:
+        clean_history = [
+            {'role': m['role'], 'content': sanitize_text(m.get('content', ''))}
+            for m in history
+            if isinstance(m, dict) and sanitize_text(m.get('content', ''))
+        ]
         fd, temp_path = tempfile.mkstemp(dir=BASE_DIR, suffix='.tmp')
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+            json.dump(clean_history, f, ensure_ascii=False, indent=2)
         os.replace(temp_path, MEMORY_FILE)
     except Exception as e:
         logging.error(f"Erreur de sauvegarde atomique mémoire : {e}")
@@ -396,25 +427,55 @@ async def execute_tool_with_timeout(fn: Callable, raw_args: dict) -> str:
 
     result = await asyncio.wait_for(_run(), timeout=TOOL_EXECUTION_TIMEOUT)
 
-    if result is None or str(result).strip() == "":
-        return f"Information : L'outil '{fn.__name__}' s'est exécuté sans retourner de données."
     if isinstance(result, (dict, list)):
-        return json.dumps(result, ensure_ascii=False, indent=2)
-    return str(result)
+        out_str = json.dumps(result, ensure_ascii=False, indent=2)
+    else:
+        out_str = str(result or "")
+
+    clean_out = sanitize_text(out_str)
+    if not clean_out:
+        return f"Information : L'outil '{fn.__name__}' s'est exécuté sans retourner de données."
+    return clean_out
+
+
+async def safe_edit_status(status_msg: Message, text: str) -> None:
+    """Met à jour le message de progression sans jamais lever d'exception."""
+    clean = sanitize_text(text)
+    if not clean:
+        return
+    try:
+        await status_msg.edit_text(clean)
+    except Exception as err:
+        logging.debug(f"Édition du statut ignorée : {err}")
 
 
 async def update_or_send_final(status_msg: Message, chat_id: int, text: str, context: ContextTypes.DEFAULT_TYPE):
-    """Remplace le message de statut par la réponse finale (et découpe si > 4000 caractères)."""
+    """Remplace le message de statut par la réponse finale avec garantie anti-texte vide."""
+    clean_text = sanitize_text(text)
+    if not clean_text:
+        clean_text = "⚠️ Traitement terminé, mais aucun texte n'a pu être généré."
+
     max_len = 4000
-    chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)] or ["(Réponse vide)"]
+    chunks = [
+        sanitize_text(clean_text[i:i + max_len])
+        for i in range(0, len(clean_text), max_len)
+    ]
+    chunks = [c for c in chunks if c] or ["⚠️ Réponse vide."]
 
     try:
         await status_msg.edit_text(chunks[0])
-    except Exception:
-        await context.bot.send_message(chat_id=chat_id, text=chunks[0])
+    except Exception as edit_err:
+        logging.warning(f"Impossible d'éditer status_msg ({edit_err}), envoi d'un nouveau message.")
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=chunks[0])
+        except Exception as send_err:
+            logging.error(f"Échec critique d'envoi Telegram : {send_err}")
 
     for extra_chunk in chunks[1:]:
-        await context.bot.send_message(chat_id=chat_id, text=extra_chunk)
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=extra_chunk)
+        except Exception as extra_err:
+            logging.error(f"Échec d'envoi d'un fragment supplémentaire : {extra_err}")
 
 
 async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, context: ContextTypes.DEFAULT_TYPE):
@@ -423,8 +484,12 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
 
     async with agent_lock:
         try:
-            # Vérification automatique à chaud si un nouveau plugin a été déposé dans plugins/
             ensure_plugins_up_to_date()
+
+            clean_user_text = sanitize_text(user_text)
+            if not clean_user_text:
+                await update_or_send_final(status_msg, chat_id, "⚠️ Message reçu vide.", context)
+                return
 
             active_tools_list = list(AVAILABLE_TOOLS.keys())
             current_time_str = datetime.now().strftime("%A %d/%m/%Y à %H:%M:%S")
@@ -438,12 +503,13 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
 
             messages: list[dict[str, Any]] = [{'role': 'system', 'content': dynamic_system_prompt}]
             messages.extend(CONVERSATION_HISTORY)
-            messages.append({'role': 'user', 'content': user_text})
+            messages.append({'role': 'user', 'content': clean_user_text})
 
             max_iterations = 6
             iteration = 0
             final_text = ""
             tools_trace = []
+            collected_tool_outputs = []
 
             generic_phrases = {
                 "opération terminée après traitement par les outils.",
@@ -454,7 +520,10 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
 
             while iteration < max_iterations:
                 iteration += 1
-                await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+                try:
+                    await context.bot.send_chat_action(chat_id=chat_id, action='typing')
+                except Exception:
+                    pass
 
                 response = await ollama_client.chat(
                     model=MODEL_NAME,
@@ -464,7 +533,7 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                 )
 
                 resp_msg = response.message
-                content = (resp_msg.content or "").strip()
+                content = sanitize_text(resp_msg.content)
                 tool_calls = resp_msg.tool_calls or []
 
                 # Cas 1 : Aucune demande d'outil -> fin de la boucle
@@ -476,10 +545,13 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                 # Cas 2 : Exécution d'un ou plusieurs outils
                 serialized_calls = []
                 for tc in tool_calls:
+                    fn_n = sanitize_text(getattr(tc.function, 'name', '')) or 'outil_inconnu'
+                    raw_args = getattr(tc.function, 'arguments', {}) or {}
+                    fn_a = dict(raw_args) if isinstance(raw_args, dict) else {}
                     serialized_calls.append({
                         'function': {
-                            'name': tc.function.name,
-                            'arguments': dict(tc.function.arguments or {})
+                            'name': fn_n,
+                            'arguments': fn_a
                         }
                     })
 
@@ -490,13 +562,14 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                 })
 
                 for tc in tool_calls:
-                    fn_name = tc.function.name
-                    fn_args = dict(tc.function.arguments or {})
+                    fn_name = sanitize_text(getattr(tc.function, 'name', '')) or 'outil_inconnu'
+                    raw_fn_args = getattr(tc.function, 'arguments', {}) or {}
+                    fn_args = dict(raw_fn_args) if isinstance(raw_fn_args, dict) else {}
 
-                    try:
-                        await status_msg.edit_text(f"⚙️ Étape {iteration}/{max_iterations} : exécution de `{fn_name}`...")
-                    except Exception:
-                        pass
+                    await safe_edit_status(
+                        status_msg,
+                        f"⚙️ Étape {iteration}/{max_iterations} : exécution de {fn_name}..."
+                    )
 
                     logging.info(f"[Tour {iteration}] Outil appelé : {fn_name} | Args : {fn_args}")
 
@@ -514,46 +587,64 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
                     else:
                         result = f"Erreur : Outil '{fn_name}' inexistant. Outils disponibles : {', '.join(active_tools_list)}"
 
+                    result = sanitize_text(result) or f"Outil {fn_name} exécuté sans retour."
+
                     if len(result) > MAX_TOOL_OUTPUT_CHARS:
                         result = result[:MAX_TOOL_OUTPUT_CHARS] + "\n...[Sortie tronquée]..."
 
                     logging.info(f"[Tour {iteration}] Retour de {fn_name} : {result[:200]}...")
                     tools_trace.append(f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)}) => {result[:250]}")
+                    collected_tool_outputs.append(f"--- Retour de {fn_name} ---\n{result}")
 
                     messages.append({
                         'role': 'tool',
-                        'name': fn_name,
-                        'content': result
+                        'content': f"[Résultat de l'outil {fn_name}]\n{result}"
                     })
 
-            # Synthèse finale forcée si le modèle s'est arrêté après un outil sans conclure proprement
-            if not final_text:
+            # Synthèse finale si le modèle a renvoyé une chaîne vide après les outils
+            clean_final = sanitize_text(final_text)
+
+            if not clean_final and collected_tool_outputs:
+                await safe_edit_status(status_msg, "🧠 Synthèse des résultats en cours...")
+
+                joined_outputs = "\n\n".join(collected_tool_outputs)
+                synthesis_prompt = [
+                    {'role': 'system', 'content': BASE_SYSTEM_PROMPT},
+                    {
+                        'role': 'user',
+                        'content': (
+                            f"Demande initiale de Florian : {clean_user_text}\n\n"
+                            f"Voici les données réelles retournées par les outils :\n{joined_outputs}\n\n"
+                            f"Rédige maintenant une réponse claire, complète et directe en français pour Florian "
+                            f"à partir de ces données."
+                        )
+                    }
+                ]
                 try:
-                    await status_msg.edit_text("🧠 Synthèse des résultats en cours...")
-                except Exception:
-                    pass
-
-                synthesis_messages = list(messages)
-                synthesis_messages.append({
-                    'role': 'user',
-                    'content': (
-                        "Exploite uniquement les données réelles retournées par les outils ci-dessus et formule "
-                        "maintenant ta réponse claire et factuelle pour Florian, sans inventer d'informations."
+                    final_res = await ollama_client.chat(
+                        model=MODEL_NAME,
+                        messages=synthesis_prompt,
+                        options=OLLAMA_OPTIONS
                     )
-                })
-                final_res = await ollama_client.chat(
-                    model=MODEL_NAME,
-                    messages=synthesis_messages,
-                    options=OLLAMA_OPTIONS
-                )
-                final_text = (final_res.message.content or "").strip() or "Outils exécutés, mais le modèle n'a généré aucun texte."
+                    clean_final = sanitize_text(final_res.message.content)
+                except Exception as synth_err:
+                    logging.warning(f"Échec de la synthèse : {synth_err}")
 
-            # Mise à jour de la mémoire persistante
-            CONVERSATION_HISTORY.append({'role': 'user', 'content': user_text})
+            # FILET DE SÉCURITÉ ABSOLU : Si le LLM reste muet, on affiche directement le retour des outils
+            if not clean_final:
+                if collected_tool_outputs:
+                    clean_final = "📋 Données récupérées :\n\n" + "\n\n".join(collected_tool_outputs)
+                else:
+                    clean_final = "⚠️ Aucune réponse générée par le modèle."
+
+            final_text = clean_final
+
+            # Mise à jour propre de la mémoire persistante (jamais de chaîne vide)
+            CONVERSATION_HISTORY.append({'role': 'user', 'content': clean_user_text})
             memory_entry = final_text
             if tools_trace:
                 memory_entry = f"[Trace outils : {' | '.join(tools_trace)}]\n{final_text}"
-            CONVERSATION_HISTORY.append({'role': 'assistant', 'content': memory_entry})
+            CONVERSATION_HISTORY.append({'role': 'assistant', 'content': sanitize_text(memory_entry)})
 
             if len(CONVERSATION_HISTORY) > (MAX_HISTORY_TURNS * 2):
                 CONVERSATION_HISTORY = CONVERSATION_HISTORY[-(MAX_HISTORY_TURNS * 2):]
@@ -563,7 +654,8 @@ async def process_agent_task(chat_id: int, user_text: str, status_msg: Message, 
 
         except Exception as e:
             logging.error(f"Erreur critique boucle agentique : {e}", exc_info=True)
-            await update_or_send_final(status_msg, chat_id, f"❌ Erreur interne : {e}", context)
+            err_str = sanitize_text(f"❌ Erreur interne : {type(e).__name__} - {e}")
+            await update_or_send_final(status_msg, chat_id, err_str or "❌ Erreur interne inconnue.", context)
 
 
 # ==============================================================================
@@ -620,8 +712,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
 
+    if not update.message or not update.message.text:
+        return
+
     chat_id = update.effective_chat.id
-    user_text = update.message.text
+    user_text = sanitize_text(update.message.text)
+    if not user_text:
+        return
+
     logging.info(f"Requête reçue : {user_text}")
 
     status_msg = await context.bot.send_message(
